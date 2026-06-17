@@ -1,0 +1,353 @@
+# Secret/key management utilities.
+#
+# Intended to be sourced, not executed. An include guard (below) makes sourcing
+# idempotent, so the file-scope `readonly` constants here are assigned exactly
+# once even if the file is sourced repeatedly in one shell (no "readonly
+# variable" errors). Apart from those guarded constants the file defines
+# functions only and changes no other global state (no `set` flags).
+
+# Include guard, C-header style (#ifndef GUARD / #define GUARD): source this file
+# at most once per shell. A re-source returns early, before any `readonly` below
+# is re-assigned. `return` at file scope is valid only when sourced, which this
+# file already requires.
+[[ -n "${_UTILS_SHLIB:-}" ]] && return 0
+readonly _UTILS_SHLIB=1
+
+# The 12-hour window, in seconds, used as the Keychain key cache TTL (shared by
+# set_key and expire_key_in_mac). Single source of truth -- change the window
+# here.
+readonly TWELVE_HOURS_IN_SECONDS=43200
+
+# Prints the value of the named environment variable on stdout.
+#
+# Arguments:
+#   1 - environment variable name (e.g. MY_API_KEY)
+function get_key_from_env() {
+  local -r var_name="${1}"
+  echo "${!var_name:-}"
+}
+
+# Probes for a CLI (the command's first word) and runs it, re-emitting the
+# command's combined output (stdout+stderr) on stdout for the caller to use.
+#
+# The return status lets each caller classify the outcome into the shared
+# three-state ladder (found / absent / errored):
+#   0   - the command succeeded; stdout holds its output (the secret)
+#   127 - the binary is not installed, so this source does not apply (absent)
+#   *   - the command ran but failed; the return value is its own exit status
+#         and stdout holds its combined output, so the caller can classify
+#         absent vs errored from whichever it prefers (exit code or message)
+#
+# Arguments:
+#   1.. - command and args to run (the binary probed is taken from arg 1)
+function probe_key_source() {
+  command -v "${1}" >/dev/null 2>&1 || return 127
+  local out status
+  out="$("$@" 2>&1)" && status=0 || status=$?
+  printf '%s' "${out}"
+  return "${status}"
+}
+
+# Runs a `security` generic-password subcommand against the macOS Keychain,
+# using key_name for both -a (account) and -s (service): there is no natural
+# mapping between a single secret name and two separate Keychain fields, so
+# using the same value for both keeps the lookup unambiguous. The verb is
+# expanded into the full "<verb>-generic-password" subcommand.
+#
+# Arguments:
+#   1   - verb (find | add | delete)
+#   2   - key name (e.g. MY_API_KEY)
+#   3.. - extra arguments appended after the identity flags
+function mac_keychain() {
+  local -r verb="${1}"
+  local -r key_name="${2}"
+  shift 2
+  security "${verb}-generic-password" -a "${key_name}" -s "${key_name}" "$@"
+}
+
+# Retrieves the named secret from the macOS Keychain and prints it on stdout.
+#
+# Exit status follows the three-state convention shared by every key source:
+#   0 - found; value printed on stdout
+#   1 - absent: the item is not in the Keychain (errSecItemNotFound, exit 44)
+#   2 - errored: a reachable source failed (e.g. exit 128 when the access
+#       prompt is denied)
+#
+# Arguments:
+#   1 - key name (e.g. MY_API_KEY)
+function get_key_from_mac() {
+  local -r key_name="${1}"
+  local value status
+  value="$(probe_key_source mac_keychain find "${key_name}" -w)" \
+    && status=0 || status=$?
+  if (( status == 0 )); then
+    printf '%s' "${value}"
+    return 0
+  fi
+  # 44 == errSecItemNotFound: the item simply isn't stored; 127 == `security`
+  # not found. Both are absent. Any other failure (e.g. 128 when the user denies
+  # the access prompt) is a source that was reachable but failed, which callers
+  # should surface loudly.
+  if (( status == 44 || status == 127 )); then
+    return 1
+  fi
+  return 2
+}
+
+# Stores a secret in the macOS Keychain. Creates the item if it does not exist;
+# updates it in place if it does (-U).
+#
+# Arguments:
+#   1 - key name  (e.g. MY_API_KEY)
+#   2 - key value
+function put_key_in_mac() {
+  local -r key_name="${1}"
+  local -r key_value="${2}"
+  mac_keychain add "${key_name}" -w "${key_value}" -U
+}
+
+# Runs a key fetcher and, on success, caches the fetched value in the macOS
+# Keychain under key_name before emitting it on stdout. A non-zero fetcher exit
+# code (the shared three-state ladder: 1 absent / 2 errored) is propagated
+# unchanged so coalesce can act on it. Nothing is cached on failure.
+#
+# This wraps the get_key_from_* sources whose values are worth caching (those
+# that hit a remote vault), giving subsequent runs a fast Keychain hit; sources
+# that are already local (env, Keychain) don't need it.
+#
+# Arguments:
+#   1   - key name to cache the value under (e.g. MY_API_KEY)
+#   2.. - fetcher command and its arguments
+function fetch_and_cache_key_in_mac() {
+  local -r key_name="${1}"
+  shift
+  local value status
+  value="$("$@")" && status=0 || status=$?
+  if (( status != 0 )); then
+    return "${status}"
+  fi
+  put_key_in_mac "${key_name}" "${value}"
+  printf '%s' "${value}"
+}
+
+# Deletes the named secret from the macOS Keychain.
+#
+# Arguments:
+#   1 - key name (e.g. MY_API_KEY)
+function del_key_from_mac() {
+  local -r key_name="${1}"
+  mac_keychain delete "${key_name}"
+}
+
+# Deletes the named secret from the macOS Keychain if it was last written more
+# than ttl_seconds ago, leaving newer or absent entries untouched. Age is read
+# from the item's "mdat" (modification date) attribute, which put_key_in_mac
+# updates on every write. Only attributes are read (not the secret value), so
+# this does not unlock the secret or trigger an access prompt.
+#
+# Arguments:
+#   1 - key name    (e.g. MY_API_KEY)
+#   2 - ttl seconds (e.g. 43200 for 12 hours)
+function expire_key_in_mac() {
+  local -r key_name="${1}"
+  local -r ttl_seconds="${2}"
+
+  local mdat
+  mdat="$(mac_keychain find "${key_name}" 2>/dev/null \
+    | sed -n 's/.*"mdat"<timedate>=.*"\([0-9]\{14\}\).*/\1/p')" || return 0
+  [[ -z "${mdat}" ]] && return 0
+
+  local mtime now
+  mtime="$(date -j -u -f '%Y%m%d%H%M%S' "${mdat}" '+%s')"
+  now="$(date -u '+%s')"
+
+  if (( now - mtime > ttl_seconds )); then
+    del_key_from_mac "${key_name}"
+  fi
+}
+
+# Retrieves the named secret from 1Password and prints it on stdout.
+#
+# Looks up a 1Password item whose title matches the key name and returns its
+# password field. Requires the 1Password CLI (`op`).
+#
+# Exit status follows the three-state convention (see get_key_from_mac):
+#   0 - found
+#   1 - absent: `op` is not installed (this user does not use 1Password) or no
+#       item matches the key name
+#   2 - errored: `op` is present but the lookup failed (e.g. not signed in)
+#
+# Arguments:
+#   1 - key name (e.g. MY_API_KEY)
+function get_key_from_1password() {
+  local -r key_name="${1}"
+  local out status
+  out="$(probe_key_source op item get "${key_name}" --field=password --reveal)" \
+    && status=0 || status=$?
+  if (( status == 0 )); then
+    printf '%s' "${out}"
+    return 0
+  fi
+  # 127 == `op` not installed: this user simply isn't a 1Password user (absent).
+  (( status == 127 )) && return 1
+  # `op` exit codes don't separate "no such item" from "not signed in", so we
+  # classify on the message. A missing item is absent; anything else (locked,
+  # signin required, connection failure) is a reachable source that errored, so
+  # the unknown case defaults to loud rather than silently swallowing it.
+  #
+  # CAUTION: matching on message text is brittle — these substrings are not a
+  # stable API, and an `op` update that rewords its errors could silently break
+  # this classification. The failure mode is safe-ish (an absent item reworded
+  # would fall through to "errored" and merely warn, never the reverse), but
+  # revisit these patterns whenever the `op` CLI is upgraded.
+  case "${out}" in
+    *"isn't an item"*|*"no item matching"*|*"not found"*) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# Retrieves the named secret from AWS Secrets Manager and prints it on stdout.
+#
+# Exit status follows the three-state convention (see get_key_from_mac):
+#   0 - found
+#   1 - absent: the `aws` CLI is not installed, the named profile does not
+#       exist, or the secret is not present (this user/profile isn't set up for
+#       AWS-managed secrets)
+#   2 - errored: `aws` ran but the request failed (expired token, access
+#       denied, connectivity)
+#
+# Arguments:
+#   1 - AWS profile (e.g. eng-common-secrets-devt)
+#   2 - secret ID   (e.g. engineering/common/MY_API_KEY)
+function get_key_from_aws() {
+  local -r profile="${1}"
+  local -r secret_id="${2}"
+  local out status
+  out="$(probe_key_source aws secretsmanager get-secret-value \
+    --profile="${profile}" --secret-id="${secret_id}" \
+    --query='SecretString' --output='text')" \
+    && status=0 || status=$?
+  if (( status == 0 )); then
+    printf '%s' "${out}"
+    return 0
+  fi
+  # 127 == `aws` not installed: AWS-managed secrets don't apply here (absent).
+  (( status == 127 )) && return 1
+  # Installed `aws` is a weak signal the user actually uses it, so a missing
+  # profile or missing secret is "not configured" (absent), not a failure. Only
+  # a genuine runtime failure (expired creds, denied access) is errored.
+  #
+  # CAUTION: matching on message text is brittle — the exception names and
+  # phrases below are not a stable contract, and an `aws` CLI/SDK update that
+  # changes its error wording could silently break this classification. The
+  # failure mode is safe-ish (a reworded "absent" case falls through to
+  # "errored" and merely warns, never the reverse), but revisit these patterns
+  # whenever the `aws` CLI is upgraded.
+  case "${out}" in
+    *ResourceNotFoundException*|*ProfileNotFound*|*"could not be found"*|*"config profile"*) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# Calls each function argument in turn, returning the output of the first that
+# both exits 0 and produces non-empty output. Skips any function that fails or
+# produces no output.
+#
+# When no function succeeds, returns the highest (most severe) exit status seen
+# among the attempted functions, defaulting to 1. This lets key sources use a
+# severity ladder -- 1 for "absent" (nothing configured) and 2 for "errored" (a
+# reachable source failed) -- and have the worst outcome propagate to the caller.
+#
+# If "--" appears in the argument list, function names are taken from the args
+# before "--" and the args after "--" are passed to every function call.
+#
+# Usage:
+#   coalesce <fn> [fn ...] [-- arg ...]
+#
+# Examples:
+#   value=$(coalesce read_from_cache read_from_disk)
+#   MY_API_KEY=$(coalesce get_key_from_env get_key_from_mac -- MY_API_KEY)
+function coalesce() {
+  local -a fns=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do
+    fns+=("$1")
+    shift
+  done
+  [[ "${1:-}" == "--" ]] && shift
+
+  local fn output status worst=1
+  for fn in "${fns[@]}"; do
+    output="$("${fn}" "$@")" && status=0 || status=$?
+    if (( status == 0 )) && [[ -n "${output}" ]]; then
+      printf '%s' "${output}"
+      return 0
+    fi
+    if (( status > worst )); then
+      worst="${status}"
+    fi
+  done
+  return "${worst}"
+}
+
+# Internal set_key source wrappers. Defined at file scope (not nested inside
+# set_key) so they are created once under the include guard rather than
+# redefined -- and leaked into the caller's shell -- on every set_key call.
+# Each wraps a remote source with fetch_and_cache_key_in_mac so a freshly
+# fetched value is cached in the Keychain for subsequent runs.
+#
+# Arguments:
+#   1 - key name (e.g. MY_API_KEY)
+function _get_key_from_1password() {
+  fetch_and_cache_key_in_mac "${1}" get_key_from_1password "${1}"
+}
+
+function _get_key_from_aws() {
+  local -r aws_profile="eng-common-secrets-devt"
+  local -r aws_prefix="engineering/common"
+  fetch_and_cache_key_in_mac "${1}" get_key_from_aws \
+    "${aws_profile}" "${aws_prefix}/${1}"
+}
+
+# Sets and exports the named environment variable, retrieving the value from
+# the first available source (existing env value, macOS Keychain, 1Password, or
+# AWS Secrets Manager).
+#
+# Exit status distinguishes the two failure modes so callers can react
+# differently:
+#   0 - a source yielded a value; the variable is set and exported
+#   1 - absent: nothing was configured in any source. Stays silent -- a fresh
+#       user who never set up a key is not a surprising case to skip quietly.
+#   2 - errored: at least one source was reachable but failed (locked vault,
+#       expired credentials, denied Keychain prompt). Warns on stderr, because a
+#       configured key that fails to retrieve is the genuinely surprising case.
+#
+# The AWS Secrets Manager secret ID is constructed by prefixing the variable
+# name with "engineering/common/".
+#
+# Arguments:
+#   1 - environment variable name (e.g. MY_API_KEY)
+function set_key() {
+  local -r var_name="${1}"
+
+  # The remote sources (_get_key_from_1password, _get_key_from_aws) are defined
+  # at file scope above; they cache freshly fetched values in the Keychain.
+
+  # Drop a stale Keychain cache entry first so an expired key is re-fetched from
+  # 1Password/AWS rather than served from the cache.
+  expire_key_in_mac "${var_name}" "${TWELVE_HOURS_IN_SECONDS}"
+  local value status
+  value="$(coalesce get_key_from_env get_key_from_mac _get_key_from_1password _get_key_from_aws -- "${var_name}")" \
+    && status=0 || status=$?
+  if (( status == 0 )); then
+    printf -v "${var_name}" '%s' "${value}"
+    export "${var_name}"
+    return 0
+  fi
+  if (( status >= 2 )); then
+    echo "Error: ${var_name} could not be retrieved: a key source was reachable but failed (locked vault, expired credentials, or denied Keychain prompt)." >&2
+    return 2
+  fi
+  # status == 1: no source had the key configured. Stay silent; the caller
+  # decides whether absence is fatal.
+  return 1
+}
