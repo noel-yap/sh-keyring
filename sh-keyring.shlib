@@ -302,10 +302,11 @@ function _get_key_from_1password() {
 }
 
 function _get_key_from_aws() {
-  local -r aws_profile="eng-common-secrets-devt"
-  local -r aws_prefix="engineering/common"
+  if [[ -z "${AWS_PROFILE:-}" || -z "${AWS_PREFIX:-}" ]]; then
+    return 1
+  fi
   fetch_and_cache_key_in_mac "${1}" get_key_from_aws \
-    "${aws_profile}" "${aws_prefix}/${1}"
+    "${AWS_PROFILE}" "${AWS_PREFIX}/${1}"
 }
 
 # Sets and exports the named environment variable, retrieving the value from
@@ -321,8 +322,9 @@ function _get_key_from_aws() {
 #       expired credentials, denied Keychain prompt). Warns on stderr, because a
 #       configured key that fails to retrieve is the genuinely surprising case.
 #
-# The AWS Secrets Manager secret ID is constructed by prefixing the variable
-# name with "engineering/common/".
+# The AWS Secrets Manager secret ID is "${AWS_PREFIX}/<VAR_NAME>" using the
+# AWS_PROFILE and AWS_PREFIX environment variables. If either is unset, the AWS
+# source is skipped (absent).
 #
 # Arguments:
 #   1 - environment variable name (e.g. MY_API_KEY)
