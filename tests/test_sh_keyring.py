@@ -236,6 +236,86 @@ def test_aws_returns_2_when_credentials_expired(runner):
 
 
 # ---------------------------------------------------------------------------
+# _get_key_from_aws
+# ---------------------------------------------------------------------------
+
+_AWS_NOT_CALLED_STUB = """
+echo "aws must not be called" >&2
+exit 99
+"""
+
+
+def test_get_key_from_aws_returns_1_when_aws_profile_is_unset(runner):
+    runner.stub("aws", _AWS_NOT_CALLED_STUB)
+    result = runner.run(
+        "_get_key_from_aws MY_API_KEY",
+        env={"AWS_PREFIX": "engineering/common"},
+    )
+    assert result.returncode == 1
+    assert result.stdout == ""
+
+
+def test_get_key_from_aws_returns_1_when_aws_prefix_is_unset(runner):
+    runner.stub("aws", _AWS_NOT_CALLED_STUB)
+    result = runner.run(
+        "_get_key_from_aws MY_API_KEY",
+        env={"AWS_PROFILE": "eng-common-secrets-devt"},
+    )
+    assert result.returncode == 1
+    assert result.stdout == ""
+
+
+def test_get_key_from_aws_fetches_and_caches_when_profile_and_prefix_are_set(
+    runner, tmp_path
+):
+    marker = tmp_path / "added"
+    aws_args = tmp_path / "aws-args"
+    runner.stub(
+        "security",
+        'if [[ "$1" == add-generic-password ]]; then echo "$@" >> "$MARKER"; fi; exit 0',
+    )
+    runner.stub(
+        "aws",
+        """
+        printf '%s\\n' "$*" >> "${AWS_ARGS_MARKER}"
+        printf 'aws-secret'
+        """,
+    )
+    result = runner.run(
+        "_get_key_from_aws MY_API_KEY",
+        env={
+            "AWS_PROFILE": "my-profile",
+            "AWS_PREFIX": "my/prefix",
+            "MARKER": marker,
+            "AWS_ARGS_MARKER": aws_args,
+        },
+    )
+    assert result.returncode == 0
+    assert result.stdout == "aws-secret"
+    assert marker.exists()
+    cached = marker.read_text()
+    assert "MY_API_KEY" in cached
+    assert "aws-secret" in cached
+    assert aws_args.read_text() == (
+        "secretsmanager get-secret-value --profile=my-profile "
+        "--secret-id=my/prefix/MY_API_KEY --query=SecretString --output=text\n"
+    )
+
+
+def test_get_key_from_aws_propagates_aws_failure(runner):
+    runner.stub("aws", 'echo "ExpiredTokenException: token expired" >&2; exit 254')
+    result = runner.run(
+        "_get_key_from_aws MY_API_KEY",
+        env={
+            "AWS_PROFILE": "my-profile",
+            "AWS_PREFIX": "my/prefix",
+        },
+    )
+    assert result.returncode == 2
+    assert result.stdout == ""
+
+
+# ---------------------------------------------------------------------------
 # coalesce
 # ---------------------------------------------------------------------------
 
