@@ -162,7 +162,10 @@ function expire_key_in_mac() {
   now="$(date -u '+%s')"
 
   if (( now - mtime > ttl_seconds )); then
-    del_key_from_mac "${key_name}"
+    # `security delete-generic-password` reports the deletion on stdout, and
+    # callers such as set_key run inside command substitutions whose stdout is
+    # the data channel -- divert the report to stderr so it stays diagnostic.
+    del_key_from_mac "${key_name}" 1>&2
   fi
 }
 

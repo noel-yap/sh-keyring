@@ -55,7 +55,9 @@ Cached Keychain entries expire after **12 hours**. Before resolving, `set_key`
 drops a stale cache entry so an expired secret is re-fetched from the remote
 vault rather than served from the cache. Expiry reads only the entry's
 modification-date attribute, so it neither unlocks the secret nor triggers an
-access prompt.
+access prompt. When a stale entry is deleted, the Keychain's deletion report is
+emitted on stderr, keeping stdout a clean data channel for callers that use
+command substitution.
 
 ### Exit status
 

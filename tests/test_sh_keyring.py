@@ -422,6 +422,37 @@ def test_set_key_exports_value_from_environment_source(runner):
     assert result.stdout == "result=env-value"
 
 
+def test_set_key_emits_nothing_on_stdout_when_expiring_a_stale_entry(runner):
+    # `security delete-generic-password` reports the deletion on stdout, and
+    # set_key is routinely called inside command substitutions whose stdout is
+    # the caller's data channel. When the cache-expiry step deletes a stale
+    # entry, that report must land on stderr, never stdout.
+    runner.stub(
+        "security",
+        """
+        case "$1" in
+          find-generic-password) printf '%s\\n' "${FIND_OUTPUT}"; exit 0 ;;
+          delete-generic-password) echo 'password has been deleted.'; exit 0 ;;
+        esac
+        exit 0
+        """,
+    )
+    snippet = """
+    set_key MY_API_KEY
+    printf 'result=%s' "${MY_API_KEY}"
+    """
+    result = runner.run(
+        snippet,
+        env={
+            "MY_API_KEY": "env-value",
+            "FIND_OUTPUT": _mdat_line("20000101000000"),
+        },
+    )
+    assert result.returncode == 0
+    assert result.stdout == "result=env-value"
+    assert "password has been deleted." in result.stderr
+
+
 def test_set_key_returns_2_and_warns_when_a_source_errors(runner):
     # No env value, no op/aws; Keychain access is denied (128) -> errored.
     runner.stub("security", "exit 128")
