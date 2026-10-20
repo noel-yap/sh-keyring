@@ -305,11 +305,11 @@ function _get_key_from_1password() {
 }
 
 function _get_key_from_aws() {
-  if [[ -z "${AWS_PROFILE:-}" || -z "${AWS_PREFIX:-}" ]]; then
+  if [[ -z "${AWS_PROFILE:-}" ]]; then
     return 1
   fi
   fetch_and_cache_key_in_mac "${1}" get_key_from_aws \
-    "${AWS_PROFILE}" "${AWS_PREFIX}/${1}"
+    "${AWS_PROFILE}" "${AWS_PREFIX:-secrets}/${1}"
 }
 
 # Sets and exports the named environment variable, retrieving the value from
@@ -326,8 +326,9 @@ function _get_key_from_aws() {
 #       configured key that fails to retrieve is the genuinely surprising case.
 #
 # The AWS Secrets Manager secret ID is "${AWS_PREFIX}/<VAR_NAME>" using the
-# AWS_PROFILE and AWS_PREFIX environment variables. If either is unset, the AWS
-# source is skipped (absent).
+# AWS_PROFILE and AWS_PREFIX environment variables. AWS_PREFIX defaults to
+# "secrets"; if AWS_PROFILE is unset, the AWS source is skipped
+# (absent).
 #
 # Arguments:
 #   1 - environment variable name (e.g. MY_API_KEY)
