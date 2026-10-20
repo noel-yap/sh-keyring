@@ -255,14 +255,22 @@ def test_get_key_from_aws_returns_1_when_aws_profile_is_unset(runner):
     assert result.stdout == ""
 
 
-def test_get_key_from_aws_returns_1_when_aws_prefix_is_unset(runner):
-    runner.stub("aws", _AWS_NOT_CALLED_STUB)
+def test_get_key_from_aws_defaults_prefix_when_aws_prefix_is_unset(runner, tmp_path):
+    aws_args = tmp_path / "aws-args"
+    runner.stub("security", "exit 0")
+    runner.stub(
+        "aws",
+        """
+        printf '%s\\n' "$*" >> "${AWS_ARGS_MARKER}"
+        printf 'aws-secret'
+        """,
+    )
     result = runner.run(
         "_get_key_from_aws MY_API_KEY",
-        env={"AWS_PROFILE": "eng-common-secrets-devt"},
+        env={"AWS_PROFILE": "my-profile", "AWS_ARGS_MARKER": aws_args},
     )
-    assert result.returncode == 1
-    assert result.stdout == ""
+    assert result.returncode == 0
+    assert "--secret-id=secrets/MY_API_KEY" in aws_args.read_text()
 
 
 def test_get_key_from_aws_fetches_and_caches_when_profile_and_prefix_are_set(
